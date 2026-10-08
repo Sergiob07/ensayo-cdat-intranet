@@ -1,0 +1,186 @@
+# Intranet (Drupal) · integración y despliegue continuos
+#
+# Pull request a develop o main → integración: composer validate, dependencias, estándar de código, pruebas y auditoría.
+# Integración en develop → construye y despliega en test (automático).
+# Integración en main    → construye y despliega en producción, con aprobación del ambiente «produccion»,
+#                          y registra la versión.
+# En cada despliegue: respaldo de la base de datos, modo mantenimiento, cambio atómico de versión,
+# drush deploy (updatedb + config:import + cache:rebuild) y reversión del código si algo falla.
+#
+# Variables del repositorio (Settings › Secrets and variables › Actions › Variables):
+#   PHP_VERSION           versión de PHP de producción (Drupal 10: 8.1 a 8.3)
+#   RUNNER_TEST           etiquetas del agente de test, en JSON. Ej.: ["self-hosted","intranet-test"]
+#   RUNNER_PRODUCCION     etiquetas del agente de producción, en JSON. Ej.: ["self-hosted","intranet-prod"]
+# Variables de cada ambiente (Settings › Environments › test / produccion):
+#   DIR_BASE              carpeta de publicación en el servidor. Ej.: /var/www/intranet
+#   URL_SALUD             URL para la prueba de humo. Ej.: http://localhost/user/login
+#   RECARGAR              (opcional) comando para recargar PHP-FPM o el servidor web
+# En el servidor (fuera del repositorio): <DIR_BASE>/shared/settings.local.php y <DIR_BASE>/shared/files/.
+name: Intranet · CI/CD
+
+on:
+  pull_request:
+    branches: [develop, main]
+  push:
+    branches: [develop, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ARTEFACTO: intranet-${{ github.sha }}
+
+jobs:
+  integracion:
+    name: Integración
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Acción de la comunidad más usada para instalar PHP en GitHub Actions.
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ vars.PHP_VERSION || '8.3' }}
+          extensions: gd, pdo_mysql, mbstring, xml, opcache, zip
+          tools: composer:v2
+
+      - name: Validar composer.json
+        run: composer validate --no-check-publish
+
+      - name: Dependencias
+        run: composer install --no-interaction --prefer-dist --no-progress
+
+      - name: Estándar de código de Drupal (módulos y temas propios)
+        run: |
+          if [ -x vendor/bin/phpcs ]; then
+            rutas=$(ls -d web/modules/custom web/themes/custom 2>/dev/null || true)
+            if [ -n "$rutas" ]; then vendor/bin/phpcs --standard=Drupal,DrupalPractice $rutas; else echo "Sin código propio"; fi
+          else
+            echo "phpcs no está en las dependencias de desarrollo (drupal/coder); se omite"
+          fi
+
+      - name: Pruebas
+        run: |
+          if [ -f phpunit.xml ] || [ -f phpunit.xml.dist ]; then vendor/bin/phpunit; else echo "Sin pruebas configuradas"; fi
+
+      - name: Auditoría de dependencias
+        run: composer audit --no-dev
+
+      - name: Empaquetar (solo dependencias de ejecución)
+        if: github.event_name != 'pull_request'
+        run: |
+          composer install --no-dev --optimize-autoloader --no-interaction --prefer-dist --no-progress
+          tar --exclude=./.git --exclude=./web/sites/default/files --exclude=./web/sites/default/settings.local.php             -czf "/tmp/$ARTEFACTO.tar.gz" . && mv "/tmp/$ARTEFACTO.tar.gz" .
+
+      - uses: actions/upload-artifact@v4
+        if: github.event_name != 'pull_request'
+        with:
+          name: ${{ env.ARTEFACTO }}
+          path: ${{ env.ARTEFACTO }}.tar.gz
+          retention-days: 30
+
+  test:
+    name: Despliegue en test
+    needs: integracion
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/develop'
+    runs-on: ${{ fromJSON(vars.RUNNER_TEST || '["self-hosted","intranet-test"]') }}
+    environment: test
+    concurrency:
+      group: intranet-test
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/scripts
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTEFACTO }}
+
+      - name: Preparar ensayo (solo repositorio de prueba)
+        if: vars.MODO_ENSAYO == 'true'
+        run: bash .github/scripts/preparar-ensayo.sh drupal "${{ vars.DIR_BASE }}"
+
+      - name: Desplegar
+        env:
+          RECARGAR: ${{ vars.RECARGAR }}
+        run: |
+          echo "ANTES=$(readlink -f '${{ vars.DIR_BASE }}/current' 2>/dev/null || true)" >> "$GITHUB_ENV"
+          rm -rf version && mkdir version && tar -xzf "$ARTEFACTO.tar.gz" -C version
+          bash .github/scripts/desplegar.sh --tipo drupal --base "${{ vars.DIR_BASE }}" \
+            --origen "$PWD/version" --id "${GITHUB_SHA::7}"
+
+      - name: Prueba de humo
+        run: bash .github/scripts/prueba-humo.sh "${{ vars.URL_SALUD }}"
+
+      - name: Revertir si falló después de activar la versión nueva
+        if: failure()
+        env:
+          RECARGAR: ${{ vars.RECARGAR }}
+        run: |
+          if [ -n "$ANTES" ] && [ "$(readlink -f '${{ vars.DIR_BASE }}/current')" != "$ANTES" ]; then
+            bash .github/scripts/desplegar.sh --tipo drupal --base "${{ vars.DIR_BASE }}" --revertir
+          else
+            echo "La versión activa no cambió; no hay nada que revertir."
+          fi
+
+  produccion:
+    name: Despliegue en producción
+    needs: integracion
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ${{ fromJSON(vars.RUNNER_PRODUCCION || '["self-hosted","intranet-prod"]') }}
+    environment: produccion
+    concurrency:
+      group: intranet-produccion
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/scripts
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTEFACTO }}
+
+      - name: Preparar ensayo (solo repositorio de prueba)
+        if: vars.MODO_ENSAYO == 'true'
+        run: bash .github/scripts/preparar-ensayo.sh drupal "${{ vars.DIR_BASE }}"
+
+      - name: Desplegar
+        env:
+          RECARGAR: ${{ vars.RECARGAR }}
+        run: |
+          echo "ANTES=$(readlink -f '${{ vars.DIR_BASE }}/current' 2>/dev/null || true)" >> "$GITHUB_ENV"
+          rm -rf version && mkdir version && tar -xzf "$ARTEFACTO.tar.gz" -C version
+          bash .github/scripts/desplegar.sh --tipo drupal --base "${{ vars.DIR_BASE }}" \
+            --origen "$PWD/version" --id "${GITHUB_SHA::7}"
+
+      - name: Prueba de humo
+        run: bash .github/scripts/prueba-humo.sh "${{ vars.URL_SALUD }}"
+
+      - name: Revertir si falló después de activar la versión nueva
+        if: failure()
+        env:
+          RECARGAR: ${{ vars.RECARGAR }}
+        run: |
+          if [ -n "$ANTES" ] && [ "$(readlink -f '${{ vars.DIR_BASE }}/current')" != "$ANTES" ]; then
+            bash .github/scripts/desplegar.sh --tipo drupal --base "${{ vars.DIR_BASE }}" --revertir
+          else
+            echo "La versión activa no cambió; no hay nada que revertir."
+          fi
+
+  version:
+    name: Registrar versión
+    needs: produccion
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Etiqueta y notas de la versión
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          etiqueta="intranet-$(date +%Y.%m.%d)-${GITHUB_RUN_NUMBER}"
+          gh release create "$etiqueta" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "Intranet $etiqueta" --generate-notes

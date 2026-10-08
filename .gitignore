@@ -1,0 +1,23 @@
+/vendor/
+/web/core/
+/web/modules/contrib/
+/web/themes/contrib/
+/web/profiles/contrib/
+/web/libraries/
+/drush/Commands/contrib/
+/web/sites/*/files/
+/web/sites/*/settings.local.php
+# Archivos que genera el scaffold de Drupal en cada instalación
+/web/*.php
+/web/.htaccess
+/web/.ht.router.php
+/web/autoload.php
+/web/robots.txt
+/web/update.php
+/web/web.config
+/web/INSTALL.txt
+/web/README.md
+/web/example.gitignore
+/web/sites/default/default.*
+/web/sites/development.services.yml
+/web/sites/example.*
